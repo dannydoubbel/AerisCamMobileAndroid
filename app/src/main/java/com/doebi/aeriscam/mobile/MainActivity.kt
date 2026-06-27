@@ -27,24 +27,45 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
+
+import android.os.Build
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanner
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.Base64
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 data class PairingQrInfo(
-    val type: String,
-    val version: Int,
-    val host: String,
-    val port: Int,
-    val bridgeUrl: String,
-    val pairingId: String,
-    val pairingToken: String,
-    val challengeSalt: String,
-    val challengeVerifier: String,
-    val challengeVerifierAlgorithm: String,
-    val expiresAt: String
+val type: String,
+val version: Int,
+val host: String,
+val port: Int,
+val bridgeUrl: String,
+val pairingId: String,
+val pairingToken: String,
+val challengeSalt: String,
+val challengeVerifier: String,
+val challengeVerifierAlgorithm: String,
+val expiresAt: String
+)
+
+data class PairingConfirmResult(
+    val status: String,
+    val message: String,
+    val sessionToken: String,
+    val sessionExpiresInSeconds: Int
 )
 
 class MainActivity : ComponentActivity() {
@@ -69,6 +90,8 @@ class MainActivity : ComponentActivity() {
                 ) {
                     var rawQrText by remember { mutableStateOf("") }
                     var challengeCode by remember { mutableStateOf("") }
+                    var pairingRequestStarted by remember { mutableStateOf(false) }
+                    var sessionToken by remember { mutableStateOf("") }
                     var statusText by remember { mutableStateOf("Not paired. Scan the AerisCam Desktop QR code.") }
                     var errorText by remember { mutableStateOf("") }
 
@@ -86,18 +109,49 @@ class MainActivity : ComponentActivity() {
 
                             val pairingInfo = parsePairingQrInfo(rawQrText)
 
-                            statusText = when {
-                                pairingInfo == null ->
-                                    "Scan a valid AerisCam Desktop QR first."
+                            when {
+                                pairingInfo == null -> {
+                                    pairingRequestStarted = false
+                                    statusText = "Scan a valid AerisCam Desktop QR first."
+                                }
 
-                                sanitizedCode.length < 6 ->
-                                    "Enter the 6-digit code shown on AerisCam Desktop."
+                                sanitizedCode.length < 6 -> {
+                                    pairingRequestStarted = false
+                                    statusText = "Enter the 6-digit code shown on AerisCam Desktop."
+                                }
 
-                                isChallengeCodeValid(pairingInfo, sanitizedCode) ->
-                                    "Code accepted locally. Ready to continue. No LAN communication yet."
+                                !isChallengeCodeValid(pairingInfo, sanitizedCode) -> {
+                                    pairingRequestStarted = false
+                                    sessionToken = ""
+                                    statusText = "Code does not match the AerisCam Desktop pairing code."
+                                }
 
-                                else ->
-                                    "Code does not match the AerisCam Desktop pairing code."
+                                !pairingRequestStarted -> {
+                                    pairingRequestStarted = true
+                                    errorText = ""
+                                    statusText = "Code accepted locally. Waiting for desktop approval..."
+
+                                    lifecycleScope.launch {
+                                        try {
+                                            val result = sendPairingConfirmRequest(
+                                                pairingInfo = pairingInfo,
+                                                challengeCode = sanitizedCode
+                                            )
+
+                                            if (result.status == "paired") {
+                                                sessionToken = result.sessionToken
+                                                statusText = "Pairing successful. Session active for ${result.sessionExpiresInSeconds} seconds."
+                                            } else {
+                                                statusText = result.message.ifBlank { "Pairing response: ${result.status}" }
+                                            }
+
+                                        } catch (exception: Exception) {
+                                            pairingRequestStarted = false
+                                            statusText = "Pairing request failed."
+                                            errorText = exception.message ?: exception::class.java.simpleName
+                                        }
+                                    }
+                                }
                             }
                         },
                         onScanQrClick = {
@@ -108,6 +162,8 @@ class MainActivity : ComponentActivity() {
                                 onRawValue = { scannedText ->
                                     rawQrText = scannedText
                                     challengeCode = ""
+                                    pairingRequestStarted = false
+                                    sessionToken = ""
 
                                     val pairingInfo = parsePairingQrInfo(scannedText)
 
@@ -223,8 +279,8 @@ fun AerisCamMobilePairingScreen(
                     challengeCode.length < 6 ->
                         "Auto-checks after 6 digits."
 
-                    pairingInfo != null && isChallengeCodeValid(pairingInfo, challengeCode) ->
-                        "Code accepted. No LAN communication yet."
+                    challengeCode.length == 6 && pairingInfo != null && isChallengeCodeValid(pairingInfo, challengeCode) ->
+                        "Code accepted. Sending pairing request to AerisCam Desktop..."
 
                     challengeCode.length == 6 ->
                         "Invalid code."
@@ -381,4 +437,141 @@ private fun sha256Hex(value: String): String {
     return hash.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xFF)
     }
+}
+
+private suspend fun sendPairingConfirmRequest(
+    pairingInfo: PairingQrInfo,
+    challengeCode: String
+): PairingConfirmResult {
+    val deviceNonce = createRandomToken()
+
+    val challengeProof = createChallengeProof(
+        pairingToken = pairingInfo.pairingToken,
+        pairingId = pairingInfo.pairingId,
+        deviceNonce = deviceNonce,
+        challengeCode = challengeCode
+    )
+
+    val requestJson = JSONObject()
+        .put("pairingId", pairingInfo.pairingId)
+        .put("deviceName", androidDeviceName())
+        .put("deviceNonce", deviceNonce)
+        .put("challengeProof", challengeProof)
+        .toString()
+
+    val responseText = httpPostJson(
+        url = "${normaliseBaseUrl(pairingInfo.bridgeUrl)}/api/mobile/pair/confirm",
+        bearerToken = pairingInfo.pairingToken,
+        jsonBody = requestJson
+    )
+
+    val root = JSONObject(responseText)
+
+    return PairingConfirmResult(
+        status = root.optString("status", "unknown"),
+        message = root.optString("message", root.optString("error", "")),
+        sessionToken = root.optString("sessionToken", ""),
+        sessionExpiresInSeconds = root.optInt("sessionExpiresInSeconds", 0)
+    )
+}
+
+private suspend fun httpPostJson(
+    url: String,
+    bearerToken: String,
+    jsonBody: String
+): String {
+    return withContext(Dispatchers.IO) {
+        val connection = URL(url).openConnection() as HttpURLConnection
+
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 5_000
+            connection.readTimeout = 65_000
+            connection.doOutput = true
+            connection.useCaches = false
+            connection.setRequestProperty("Connection", "close")
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("Authorization", "Bearer $bearerToken")
+
+            connection.outputStream.use { outputStream ->
+                outputStream.write(jsonBody.toByteArray(Charsets.UTF_8))
+            }
+
+            val responseCode = connection.responseCode
+
+            val responseBytes = if (responseCode in 200..299) {
+                connection.inputStream.use { it.readBytes() }
+            } else {
+                connection.errorStream?.use { it.readBytes() } ?: ByteArray(0)
+            }
+
+            val responseText = responseBytes.decodeToString()
+
+            if (responseCode !in 200..299) {
+                error("HTTP $responseCode: $responseText")
+            }
+
+            responseText
+
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+
+private fun createChallengeProof(
+    pairingToken: String,
+    pairingId: String,
+    deviceNonce: String,
+    challengeCode: String
+): String {
+    val message = "$pairingId:$deviceNonce:$challengeCode"
+
+    return hmacSha256Hex(
+        key = pairingToken,
+        message = message
+    )
+}
+
+private fun hmacSha256Hex(
+    key: String,
+    message: String
+): String {
+    val mac = Mac.getInstance("HmacSHA256")
+
+    mac.init(SecretKeySpec(
+        key.toByteArray(Charsets.UTF_8),
+        "HmacSHA256"
+    ))
+
+    val hash = mac.doFinal(message.toByteArray(Charsets.UTF_8))
+
+    return hash.joinToString("") { byte ->
+        "%02x".format(byte.toInt() and 0xFF)
+    }
+}
+
+private fun createRandomToken(): String {
+    val bytes = ByteArray(32)
+    SecureRandom().nextBytes(bytes)
+
+    return Base64.getUrlEncoder()
+        .withoutPadding()
+        .encodeToString(bytes)
+}
+
+private fun androidDeviceName(): String {
+    val manufacturer = Build.MANUFACTURER ?: ""
+    val model = Build.MODEL ?: ""
+
+    return listOf(manufacturer, model)
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .joinToString(" ")
+        .ifBlank { "Android device" }
+}
+
+private fun normaliseBaseUrl(raw: String): String {
+    return raw.trim().trimEnd('/')
 }
