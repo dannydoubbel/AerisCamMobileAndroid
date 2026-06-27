@@ -7,10 +7,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -68,6 +66,13 @@ data class PairingConfirmResult(
     val sessionExpiresInSeconds: Int
 )
 
+data class MobileCamera(
+    val id: String,
+    val name: String,
+    val thumbnailUrl: String,
+    val qualities: List<String>
+)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var scanner: GmsBarcodeScanner
@@ -92,14 +97,17 @@ class MainActivity : ComponentActivity() {
                     var challengeCode by remember { mutableStateOf("") }
                     var pairingRequestStarted by remember { mutableStateOf(false) }
                     var sessionToken by remember { mutableStateOf("") }
+                    var cameras by remember { mutableStateOf<List<MobileCamera>>(emptyList()) }
                     var statusText by remember { mutableStateOf("Not paired. Scan the AerisCam Desktop QR code.") }
                     var errorText by remember { mutableStateOf("") }
 
                     AerisCamMobilePairingScreen(
-                        rawQrText = rawQrText,
-                        challengeCode = challengeCode,
-                        statusText = statusText,
-                        errorText = errorText,
+                            rawQrText = rawQrText,
+                            challengeCode = challengeCode,
+                            sessionToken = sessionToken,
+                            cameras = cameras,
+                            statusText = statusText,
+                            errorText = errorText,
                         onChallengeCodeChange = { newValue ->
                             val sanitizedCode = newValue
                                 .filter { it.isDigit() }
@@ -140,7 +148,14 @@ class MainActivity : ComponentActivity() {
 
                                             if (result.status == "paired") {
                                                 sessionToken = result.sessionToken
-                                                statusText = "Pairing successful. Session active for ${result.sessionExpiresInSeconds} seconds."
+                                                statusText = "Pairing successful. Loading cameras..."
+
+                                                cameras = fetchCameraList(
+                                                    bridgeUrl = pairingInfo.bridgeUrl,
+                                                    sessionToken = result.sessionToken
+                                                )
+
+                                                statusText = "Pairing successful. Loaded ${cameras.size} camera(s)."
                                             } else {
                                                 statusText = result.message.ifBlank { "Pairing response: ${result.status}" }
                                             }
@@ -164,6 +179,7 @@ class MainActivity : ComponentActivity() {
                                     challengeCode = ""
                                     pairingRequestStarted = false
                                     sessionToken = ""
+                                    cameras = emptyList()
 
                                     val pairingInfo = parsePairingQrInfo(scannedText)
 
@@ -217,13 +233,14 @@ class MainActivity : ComponentActivity() {
 fun AerisCamMobilePairingScreen(
     rawQrText: String,
     challengeCode: String,
+    sessionToken: String,
+    cameras: List<MobileCamera>,
     statusText: String,
     errorText: String,
     onChallengeCodeChange: (String) -> Unit,
     onScanQrClick: () -> Unit
 ) {
     val pairingInfo = parsePairingQrInfo(rawQrText)
-    val prettyJson = formatJsonForDisplay(rawQrText)
 
     Column(
         modifier = Modifier
@@ -288,26 +305,45 @@ fun AerisCamMobilePairingScreen(
                     else ->
                         ""
                 }
-            )
 
+            )
+            if (sessionToken.isNotBlank()) {
+                CameraListCard(cameras)
+            }
+
+
+        }
+    }
+}
+
+@Composable
+private fun CameraListCard(cameras: List<MobileCamera>) {
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             Text(
-                text = "Decoded QR JSON",
+                text = "Cameras",
                 style = MaterialTheme.typography.titleMedium
             )
 
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                SelectionContainer {
-                    Text(
-                        text = prettyJson,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 160.dp)
-                            .padding(12.dp),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
+            if (cameras.isEmpty()) {
+                Text("No cameras returned by AerisCam.")
+                return@Column
+            }
+
+            cameras.forEachIndexed { index, camera ->
+                Text(
+                    text = "${index + 1}. ${camera.name}",
+                    style = MaterialTheme.typography.titleSmall
+                )
+
+                Text(
+                    text = "Qualities: ${camera.qualities.joinToString(", ")}"
+                )
             }
         }
     }
@@ -323,19 +359,12 @@ private fun PairingSummaryCard(pairingInfo: PairingQrInfo) {
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Text(
-                text = "Pairing QR detected",
+                text = "AerisCam QR detected",
                 style = MaterialTheme.typography.titleSmall
             )
 
-            Text("Type: ${pairingInfo.type}")
-            Text("Version: ${pairingInfo.version}")
-            Text("Host: ${pairingInfo.host}")
-            Text("Port: ${pairingInfo.port}")
-            Text("Bridge URL: ${pairingInfo.bridgeUrl}")
-            Text("Pairing ID: ${pairingInfo.pairingId}")
-            Text("Expires at: ${pairingInfo.expiresAt}")
-            Text("Challenge verifier: present")
-            Text("Pairing token: present")
+            Text("Bridge: ${pairingInfo.host}:${pairingInfo.port}")
+            Text("Enter the 6-digit code shown on AerisCam Desktop.")
         }
     }
 }
@@ -373,21 +402,8 @@ private fun parsePairingQrInfo(rawQrText: String): PairingQrInfo? {
     }
 }
 
-private fun formatJsonForDisplay(rawQrText: String): String {
-    if (rawQrText.isBlank()) {
-        return ""
-    }
 
-    return try {
-        JSONObject(rawQrText).toString(2)
-    } catch (_: Exception) {
-        rawQrText
-    }
-}
 
-private fun yesNo(value: Boolean): String {
-    return if (value) "yes" else "no"
-}
 
 private fun isChallengeCodeValid(
     pairingInfo: PairingQrInfo,
@@ -574,4 +590,85 @@ private fun androidDeviceName(): String {
 
 private fun normaliseBaseUrl(raw: String): String {
     return raw.trim().trimEnd('/')
+}
+
+private suspend fun fetchCameraList(
+    bridgeUrl: String,
+    sessionToken: String
+): List<MobileCamera> {
+    val responseText = httpGetJson(
+        url = "${normaliseBaseUrl(bridgeUrl)}/api/cameras",
+        bearerToken = sessionToken
+    )
+
+    val root = JSONObject(responseText)
+    val camerasArray = root.optJSONArray("cameras") ?: return emptyList()
+
+    val cameras = mutableListOf<MobileCamera>()
+
+    for (index in 0 until camerasArray.length()) {
+        val cameraObject = camerasArray.optJSONObject(index) ?: continue
+        val qualitiesArray = cameraObject.optJSONArray("qualities")
+
+        val qualities = mutableListOf<String>()
+
+        if (qualitiesArray != null) {
+            for (qualityIndex in 0 until qualitiesArray.length()) {
+                val quality = qualitiesArray.optString(qualityIndex, "")
+
+                if (quality.isNotBlank()) {
+                    qualities.add(quality)
+                }
+            }
+        }
+
+        cameras.add(
+            MobileCamera(
+                id = cameraObject.optString("id", ""),
+                name = cameraObject.optString("name", "Unnamed camera"),
+                thumbnailUrl = cameraObject.optString("thumbnailUrl", ""),
+                qualities = qualities
+            )
+        )
+    }
+
+    return cameras
+}
+
+private suspend fun httpGetJson(
+    url: String,
+    bearerToken: String
+): String {
+    return withContext(Dispatchers.IO) {
+        val connection = URL(url).openConnection() as HttpURLConnection
+
+        try {
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 5_000
+            connection.readTimeout = 10_000
+            connection.useCaches = false
+            connection.setRequestProperty("Connection", "close")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("Authorization", "Bearer $bearerToken")
+
+            val responseCode = connection.responseCode
+
+            val responseBytes = if (responseCode in 200..299) {
+                connection.inputStream.use { it.readBytes() }
+            } else {
+                connection.errorStream?.use { it.readBytes() } ?: ByteArray(0)
+            }
+
+            val responseText = responseBytes.decodeToString()
+
+            if (responseCode !in 200..299) {
+                error("HTTP $responseCode: $responseText")
+            }
+
+            responseText
+
+        } finally {
+            connection.disconnect()
+        }
+    }
 }
