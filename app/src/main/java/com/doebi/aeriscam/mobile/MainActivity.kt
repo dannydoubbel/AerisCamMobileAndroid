@@ -32,7 +32,7 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanner
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import org.json.JSONObject
-
+import java.security.MessageDigest
 data class PairingQrInfo(
     val type: String,
     val version: Int,
@@ -40,9 +40,11 @@ data class PairingQrInfo(
     val port: Int,
     val bridgeUrl: String,
     val pairingId: String,
-    val expiresAt: String,
-    val hasObfuscatedChallenge: Boolean,
-    val hasPairingToken: Boolean
+    val pairingToken: String,
+    val challengeSalt: String,
+    val challengeVerifier: String,
+    val challengeVerifierAlgorithm: String,
+    val expiresAt: String
 )
 
 class MainActivity : ComponentActivity() {
@@ -76,9 +78,27 @@ class MainActivity : ComponentActivity() {
                         statusText = statusText,
                         errorText = errorText,
                         onChallengeCodeChange = { newValue ->
-                            challengeCode = newValue
+                            val sanitizedCode = newValue
                                 .filter { it.isDigit() }
                                 .take(6)
+
+                            challengeCode = sanitizedCode
+
+                            val pairingInfo = parsePairingQrInfo(rawQrText)
+
+                            statusText = when {
+                                pairingInfo == null ->
+                                    "Scan a valid AerisCam Desktop QR first."
+
+                                sanitizedCode.length < 6 ->
+                                    "Enter the 6-digit code shown on AerisCam Desktop."
+
+                                isChallengeCodeValid(pairingInfo, sanitizedCode) ->
+                                    "Code accepted locally. Ready to continue. No LAN communication yet."
+
+                                else ->
+                                    "Code does not match the AerisCam Desktop pairing code."
+                            }
                         },
                         onScanQrClick = {
                             errorText = ""
@@ -200,8 +220,17 @@ fun AerisCamMobilePairingScreen(
 
             Text(
                 text = when {
-                    challengeCode.length < 6 -> "Enter the 6-digit code shown on AerisCam Desktop."
-                    else -> "Code entered locally. No LAN communication yet."
+                    challengeCode.length < 6 ->
+                        "Auto-checks after 6 digits."
+
+                    pairingInfo != null && isChallengeCodeValid(pairingInfo, challengeCode) ->
+                        "Code accepted. No LAN communication yet."
+
+                    challengeCode.length == 6 ->
+                        "Invalid code."
+
+                    else ->
+                        ""
                 }
             )
 
@@ -249,8 +278,8 @@ private fun PairingSummaryCard(pairingInfo: PairingQrInfo) {
             Text("Bridge URL: ${pairingInfo.bridgeUrl}")
             Text("Pairing ID: ${pairingInfo.pairingId}")
             Text("Expires at: ${pairingInfo.expiresAt}")
-            Text("Obfuscated challenge present: ${yesNo(pairingInfo.hasObfuscatedChallenge)}")
-            Text("Pairing token present: ${yesNo(pairingInfo.hasPairingToken)}")
+            Text("Challenge verifier: present")
+            Text("Pairing token: present")
         }
     }
 }
@@ -263,16 +292,24 @@ private fun parsePairingQrInfo(rawQrText: String): PairingQrInfo? {
     return try {
         val root = JSONObject(rawQrText)
 
+        val type = root.optString("type", "")
+
+        if (type != "aeriscam-mobile-pairing") {
+            return null
+        }
+
         PairingQrInfo(
-            type = root.optString("type", ""),
+            type = type,
             version = root.optInt("version", 0),
             host = root.optString("host", ""),
             port = root.optInt("port", 0),
             bridgeUrl = root.optString("bridgeUrl", ""),
             pairingId = root.optString("pairingId", ""),
-            expiresAt = root.optString("expiresAt", ""),
-            hasObfuscatedChallenge = root.optString("pairingChallengeObfuscated", "").isNotBlank(),
-            hasPairingToken = root.optString("pairingToken", "").isNotBlank()
+            pairingToken = root.optString("pairingToken", ""),
+            challengeSalt = root.optString("challengeSalt", ""),
+            challengeVerifier = root.optString("challengeVerifier", ""),
+            challengeVerifierAlgorithm = root.optString("challengeVerifierAlgorithm", ""),
+            expiresAt = root.optString("expiresAt", "")
         )
 
     } catch (_: Exception) {
@@ -294,4 +331,54 @@ private fun formatJsonForDisplay(rawQrText: String): String {
 
 private fun yesNo(value: Boolean): String {
     return if (value) "yes" else "no"
+}
+
+private fun isChallengeCodeValid(
+    pairingInfo: PairingQrInfo,
+    challengeCode: String
+): Boolean {
+    if (challengeCode.length != 6) {
+        return false
+    }
+
+    if (pairingInfo.challengeVerifierAlgorithm != "SHA-256-v1") {
+        return false
+    }
+
+    if (pairingInfo.pairingId.isBlank()
+        || pairingInfo.challengeSalt.isBlank()
+        || pairingInfo.challengeVerifier.isBlank()
+    ) {
+        return false
+    }
+
+    val calculatedVerifier = createChallengeVerifier(
+        pairingId = pairingInfo.pairingId,
+        challengeSalt = pairingInfo.challengeSalt,
+        pairingCode = challengeCode
+    )
+
+    return calculatedVerifier.equals(
+        pairingInfo.challengeVerifier,
+        ignoreCase = true
+    )
+}
+
+private fun createChallengeVerifier(
+    pairingId: String,
+    challengeSalt: String,
+    pairingCode: String
+): String {
+    val verifierInput = "$pairingId:$challengeSalt:$pairingCode"
+
+    return sha256Hex(verifierInput)
+}
+
+private fun sha256Hex(value: String): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val hash = digest.digest(value.toByteArray(Charsets.UTF_8))
+
+    return hash.joinToString("") { byte ->
+        "%02x".format(byte.toInt() and 0xFF)
+    }
 }
