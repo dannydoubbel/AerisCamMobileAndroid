@@ -1,22 +1,16 @@
 package com.doebi.aeriscam.mobile
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -28,39 +22,42 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanner
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 
-data class BridgeStatus(
-    val app: String,
-    val bridge: String,
-    val version: String
-)
-
-data class CameraListResponse(
-    val cameras: List<BridgeCamera>
-)
-
-data class BridgeCamera(
-    val id: String,
-    val name: String,
-    val thumbnailUrl: String,
-    val qualities: List<String>
+data class PairingQrInfo(
+    val type: String,
+    val version: Int,
+    val host: String,
+    val port: Int,
+    val bridgeUrl: String,
+    val pairingId: String,
+    val expiresAt: String,
+    val hasObfuscatedChallenge: Boolean,
+    val hasPairingToken: Boolean
 )
 
 class MainActivity : ComponentActivity() {
+
+    private lateinit var scanner: GmsBarcodeScanner
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val scannerOptions = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAutoZoom()
+            .build()
+
+        scanner = GmsBarcodeScanning.getClient(this, scannerOptions)
 
         setContent {
             MaterialTheme {
@@ -68,24 +65,89 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    AerisCamMobileScreen()
+                    var rawQrText by remember { mutableStateOf("") }
+                    var challengeCode by remember { mutableStateOf("") }
+                    var statusText by remember { mutableStateOf("Not paired. Scan the AerisCam Desktop QR code.") }
+                    var errorText by remember { mutableStateOf("") }
+
+                    AerisCamMobilePairingScreen(
+                        rawQrText = rawQrText,
+                        challengeCode = challengeCode,
+                        statusText = statusText,
+                        errorText = errorText,
+                        onChallengeCodeChange = { newValue ->
+                            challengeCode = newValue
+                                .filter { it.isDigit() }
+                                .take(6)
+                        },
+                        onScanQrClick = {
+                            errorText = ""
+                            statusText = "Opening QR scanner..."
+
+                            startQrScan(
+                                onRawValue = { scannedText ->
+                                    rawQrText = scannedText
+                                    challengeCode = ""
+
+                                    val pairingInfo = parsePairingQrInfo(scannedText)
+
+                                    statusText = if (pairingInfo == null) {
+                                        "QR scanned, but it does not look like AerisCam pairing JSON."
+                                    } else {
+                                        "AerisCam QR scanned. Enter the 6-digit code shown on desktop."
+                                    }
+                                },
+                                onCanceled = {
+                                    statusText = "QR scan cancelled."
+                                },
+                                onFailure = { exception ->
+                                    statusText = "QR scan failed."
+                                    errorText = exception.message ?: exception::class.java.simpleName
+                                }
+                            )
+                        }
+                    )
                 }
             }
         }
     }
+
+    private fun startQrScan(
+        onRawValue: (String) -> Unit,
+        onCanceled: () -> Unit,
+        onFailure: (Exception) -> Unit
+    ) {
+        scanner.startScan()
+            .addOnSuccessListener { barcode ->
+                val rawValue = barcode.rawValue
+
+                if (rawValue.isNullOrBlank()) {
+                    onFailure(IllegalStateException("QR code did not contain readable text."))
+                    return@addOnSuccessListener
+                }
+
+                onRawValue(rawValue)
+            }
+            .addOnCanceledListener {
+                onCanceled()
+            }
+            .addOnFailureListener { exception ->
+                onFailure(exception)
+            }
+    }
 }
 
 @Composable
-fun AerisCamMobileScreen() {
-    val scope = rememberCoroutineScope()
-
-    var bridgeBaseUrl by remember { mutableStateOf("http://10.0.2.2:18080") }
-    var statusText by remember { mutableStateOf("Not checked yet") }
-    var errorText by remember { mutableStateOf("") }
-    var cameras by remember { mutableStateOf<List<BridgeCamera>>(emptyList()) }
-    var selectedCameraName by remember { mutableStateOf("") }
-    var thumbnailBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var busy by remember { mutableStateOf(false) }
+fun AerisCamMobilePairingScreen(
+    rawQrText: String,
+    challengeCode: String,
+    statusText: String,
+    errorText: String,
+    onChallengeCodeChange: (String) -> Unit,
+    onScanQrClick: () -> Unit
+) {
+    val pairingInfo = parsePairingQrInfo(rawQrText)
+    val prettyJson = formatJsonForDisplay(rawQrText)
 
     Column(
         modifier = Modifier
@@ -99,63 +161,16 @@ fun AerisCamMobileScreen() {
             style = MaterialTheme.typography.headlineMedium
         )
 
-        OutlinedTextField(
-            value = bridgeBaseUrl,
-            onValueChange = { bridgeBaseUrl = it },
-            label = { Text("Bridge base URL") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
+        Text(
+            text = "QR pairing test",
+            style = MaterialTheme.typography.titleMedium
         )
 
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        Button(
+            onClick = onScanQrClick,
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Button(
-                enabled = !busy,
-                onClick = {
-                    scope.launch {
-                        busy = true
-                        errorText = ""
-                        statusText = "Checking bridge..."
-
-                        try {
-                            val status = fetchBridgeStatus(bridgeBaseUrl)
-                            statusText = "Bridge ${status.bridge} - ${status.app} ${status.version}"
-                        } catch (e: Exception) {
-                            statusText = "Bridge check failed"
-                            errorText = e.message ?: "Unknown error"
-                        } finally {
-                            busy = false
-                        }
-                    }
-                }
-            ) {
-                Text("Check bridge status")
-            }
-
-            Button(
-                enabled = !busy,
-                onClick = {
-                    scope.launch {
-                        busy = true
-                        errorText = ""
-                        statusText = "Loading cameras..."
-
-                        try {
-                            val response = fetchCameras(bridgeBaseUrl)
-                            cameras = response.cameras
-                            statusText = "Loaded ${response.cameras.size} camera(s)"
-                        } catch (e: Exception) {
-                            statusText = "Camera load failed"
-                            errorText = e.message ?: "Unknown error"
-                        } finally {
-                            busy = false
-                        }
-                    }
-                }
-            ) {
-                Text("Load cameras")
-            }
+            Text("Scan AerisCam QR")
         }
 
         Text(text = statusText)
@@ -167,188 +182,116 @@ fun AerisCamMobileScreen() {
             )
         }
 
-        if (cameras.isNotEmpty()) {
-            Text(
-                text = "Cameras",
-                style = MaterialTheme.typography.titleMedium
-            )
-
-            cameras.forEach { camera ->
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable {
-                            scope.launch {
-                                busy = true
-                                errorText = ""
-                                selectedCameraName = camera.name
-                                statusText = "Loading thumbnail for ${camera.name}..."
-
-                                try {
-                                    thumbnailBitmap = fetchCameraThumbnail(
-                                        bridgeBaseUrl = bridgeBaseUrl,
-                                        camera = camera
-                                    )
-                                    statusText = "Thumbnail loaded for ${camera.name}"
-                                } catch (e: Exception) {
-                                    thumbnailBitmap = null
-                                    statusText = "Thumbnail load failed"
-                                    errorText = e.message ?: "Unknown error"
-                                } finally {
-                                    busy = false
-                                }
-                            }
-                        }
-                ) {
-                    Column(
-                        modifier = Modifier.padding(12.dp)
-                    ) {
-                        Text(
-                            text = camera.name,
-                            style = MaterialTheme.typography.titleSmall
-                        )
-
-                        Text(
-                            text = "ID: ${camera.id} | Qualities: ${camera.qualities.joinToString()}",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-            }
+        if (pairingInfo != null) {
+            PairingSummaryCard(pairingInfo)
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
-
-        if (selectedCameraName.isNotBlank()) {
-            Text(
-                text = "Selected: $selectedCameraName",
-                style = MaterialTheme.typography.titleMedium
-            )
-        }
-
-        thumbnailBitmap?.let { bitmap ->
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = "Camera thumbnail",
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 180.dp, max = 360.dp),
-                contentScale = ContentScale.Fit
-            )
-        }
-    }
-}
-
-private suspend fun fetchBridgeStatus(baseUrl: String): BridgeStatus {
-    val jsonText = httpGetText("${normaliseBaseUrl(baseUrl)}/api/status")
-    val root = JSONObject(jsonText)
-
-    return BridgeStatus(
-        app = root.optString("app", "unknown"),
-        bridge = root.optString("bridge", "unknown"),
-        version = root.optString("version", "unknown")
-    )
-}
-
-private suspend fun fetchCameras(baseUrl: String): CameraListResponse {
-    val jsonText = httpGetText("${normaliseBaseUrl(baseUrl)}/api/cameras")
-    val root = JSONObject(jsonText)
-    val cameraArray = root.optJSONArray("cameras")
-
-    val cameras = mutableListOf<BridgeCamera>()
-
-    if (cameraArray != null) {
-        for (i in 0 until cameraArray.length()) {
-            val cameraJson = cameraArray.getJSONObject(i)
-            val qualitiesJson = cameraJson.optJSONArray("qualities")
-            val qualities = mutableListOf<String>()
-
-            if (qualitiesJson != null) {
-                for (q in 0 until qualitiesJson.length()) {
-                    qualities.add(qualitiesJson.optString(q))
-                }
-            }
-
-            cameras.add(
-                BridgeCamera(
-                    id = cameraJson.optString("id"),
-                    name = cameraJson.optString("name"),
-                    thumbnailUrl = cameraJson.optString("thumbnailUrl"),
-                    qualities = qualities
+        if (rawQrText.isNotBlank()) {
+            OutlinedTextField(
+                value = challengeCode,
+                onValueChange = onChallengeCodeChange,
+                label = { Text("6-digit challenge code") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.NumberPassword
                 )
             )
-        }
-    }
 
-    return CameraListResponse(cameras = cameras)
-}
+            Text(
+                text = when {
+                    challengeCode.length < 6 -> "Enter the 6-digit code shown on AerisCam Desktop."
+                    else -> "Code entered locally. No LAN communication yet."
+                }
+            )
 
-private suspend fun fetchCameraThumbnail(
-    bridgeBaseUrl: String,
-    camera: BridgeCamera
-): Bitmap {
-    val thumbnailUrl = buildThumbnailUrl(
-        bridgeBaseUrl = bridgeBaseUrl,
-        camera = camera
-    )
+            Text(
+                text = "Decoded QR JSON",
+                style = MaterialTheme.typography.titleMedium
+            )
 
-    val bytes = httpGetBytes(thumbnailUrl)
-
-    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        ?: error("Could not decode JPEG thumbnail")
-}
-
-private fun buildThumbnailUrl(
-    bridgeBaseUrl: String,
-    camera: BridgeCamera
-): String {
-    val thumbnailUrlFromBridge = camera.thumbnailUrl.trim()
-
-    if (thumbnailUrlFromBridge.startsWith("http://") || thumbnailUrlFromBridge.startsWith("https://")) {
-        return thumbnailUrlFromBridge
-    }
-
-    if (thumbnailUrlFromBridge.isNotBlank()) {
-        return "${normaliseBaseUrl(bridgeBaseUrl)}/${thumbnailUrlFromBridge.trimStart('/')}"
-    }
-
-    return "${normaliseBaseUrl(bridgeBaseUrl)}/api/cameras/${camera.id}/thumbnail"
-}
-
-private suspend fun httpGetText(url: String): String {
-    return httpGetBytes(url).decodeToString()
-}
-
-private suspend fun httpGetBytes(url: String): ByteArray {
-    return withContext(Dispatchers.IO) {
-        val connection = URL(url).openConnection() as HttpURLConnection
-
-        try {
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 3_000
-            connection.readTimeout = 8_000
-
-            val responseCode = connection.responseCode
-            val stream = if (responseCode in 200..299) {
-                connection.inputStream
-            } else {
-                connection.errorStream
+            Card(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                SelectionContainer {
+                    Text(
+                        text = prettyJson,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 160.dp)
+                            .padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
             }
-
-            val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
-
-            if (responseCode !in 200..299) {
-                val body = bytes.decodeToString()
-                error("HTTP $responseCode from $url: $body")
-            }
-
-            bytes
-        } finally {
-            connection.disconnect()
         }
     }
 }
 
-private fun normaliseBaseUrl(raw: String): String {
-    return raw.trim().trimEnd('/')
+@Composable
+private fun PairingSummaryCard(pairingInfo: PairingQrInfo) {
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(
+                text = "Pairing QR detected",
+                style = MaterialTheme.typography.titleSmall
+            )
+
+            Text("Type: ${pairingInfo.type}")
+            Text("Version: ${pairingInfo.version}")
+            Text("Host: ${pairingInfo.host}")
+            Text("Port: ${pairingInfo.port}")
+            Text("Bridge URL: ${pairingInfo.bridgeUrl}")
+            Text("Pairing ID: ${pairingInfo.pairingId}")
+            Text("Expires at: ${pairingInfo.expiresAt}")
+            Text("Obfuscated challenge present: ${yesNo(pairingInfo.hasObfuscatedChallenge)}")
+            Text("Pairing token present: ${yesNo(pairingInfo.hasPairingToken)}")
+        }
+    }
+}
+
+private fun parsePairingQrInfo(rawQrText: String): PairingQrInfo? {
+    if (rawQrText.isBlank()) {
+        return null
+    }
+
+    return try {
+        val root = JSONObject(rawQrText)
+
+        PairingQrInfo(
+            type = root.optString("type", ""),
+            version = root.optInt("version", 0),
+            host = root.optString("host", ""),
+            port = root.optInt("port", 0),
+            bridgeUrl = root.optString("bridgeUrl", ""),
+            pairingId = root.optString("pairingId", ""),
+            expiresAt = root.optString("expiresAt", ""),
+            hasObfuscatedChallenge = root.optString("pairingChallengeObfuscated", "").isNotBlank(),
+            hasPairingToken = root.optString("pairingToken", "").isNotBlank()
+        )
+
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun formatJsonForDisplay(rawQrText: String): String {
+    if (rawQrText.isBlank()) {
+        return ""
+    }
+
+    return try {
+        JSONObject(rawQrText).toString(2)
+    } catch (_: Exception) {
+        rawQrText
+    }
+}
+
+private fun yesNo(value: Boolean): String {
+    return if (value) "yes" else "no"
 }
