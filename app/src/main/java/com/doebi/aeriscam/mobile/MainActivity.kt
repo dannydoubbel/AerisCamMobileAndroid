@@ -1,16 +1,21 @@
 package com.doebi.aeriscam.mobile
 
 import android.graphics.BitmapFactory
+import androidx.activity.compose.BackHandler
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,17 +33,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 
 import android.os.Build
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
 
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanner
@@ -52,42 +58,16 @@ import java.security.SecureRandom
 import java.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
-data class PairingQrInfo(
-    val type: String,
-    val version: Int,
-    val host: String,
-    val port: Int,
-    val bridgeUrl: String,
-    val pairingId: String,
-    val pairingToken: String,
-    val challengeSalt: String,
-    val challengeVerifier: String,
-    val challengeVerifierAlgorithm: String,
-    val expiresAt: String
-)
-
-data class PairingConfirmResult(
-    val status: String,
-    val message: String,
-    val sessionToken: String,
-    val sessionExpiresInSeconds: Int
-)
-
-data class MobileCamera(
-    val id: String,
-    val name: String,
-    val thumbnailUrl: String,
-    val qualities: List<String>
-)
-
-private const val MAX_INVALID_CHALLENGE_ATTEMPTS = 5
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var scanner: GmsBarcodeScanner
+    private lateinit var mobileViewModel: AerisCamMobileViewModel
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        mobileViewModel = ViewModelProvider(this)[AerisCamMobileViewModel::class.java]
 
         val scannerOptions = GmsBarcodeScannerOptions.Builder()
             .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
@@ -102,173 +82,195 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    var rawQrText by remember { mutableStateOf("") }
-                    var challengeCode by remember { mutableStateOf("") }
-                    var invalidChallengeAttempts by remember { mutableStateOf(0) }
-                    var lastInvalidChallengeCode by remember { mutableStateOf("") }
-                    var pairingRequestStarted by remember { mutableStateOf(false) }
-                    var sessionToken by remember { mutableStateOf("") }
-                    var cameras by remember { mutableStateOf<List<MobileCamera>>(emptyList()) }
-                    var selectedCamera by remember { mutableStateOf<MobileCamera?>(null) }
-                    var statusText by remember { mutableStateOf("Not paired. Scan the AerisCam Desktop QR code.") }
-                    var errorText by remember { mutableStateOf("") }
+                    val pairingInfo = parsePairingQrInfo(mobileViewModel.rawQrText)
+
+                    androidx.compose.runtime.LaunchedEffect(
+                        mobileViewModel.rawQrText,
+                        mobileViewModel.sessionToken
+                    ) {
+                        if (mobileViewModel.sessionToken.isNotBlank()
+                            && mobileViewModel.cameras.isEmpty()
+                            && pairingInfo != null
+                        ) {
+                            try {
+                                mobileViewModel.statusText = "Restoring camera list..."
+
+                                mobileViewModel.cameras = fetchCameraList(
+                                    bridgeUrl = pairingInfo.bridgeUrl,
+                                    sessionToken = mobileViewModel.sessionToken
+                                )
+
+                                mobileViewModel.statusText =
+                                    "Pairing successful. Loaded ${mobileViewModel.cameras.size} camera(s)."
+
+                            } catch (exception: Exception) {
+                                mobileViewModel.statusText = "Could not restore camera list."
+                                mobileViewModel.errorText = exception.message
+                                    ?: exception::class.java.simpleName
+                            }
+                        }
+                    }
 
                     AerisCamMobilePairingScreen(
-                        rawQrText = rawQrText,
-                        challengeCode = challengeCode,
-                        sessionToken = sessionToken,
-                        cameras = cameras,
-                        selectedCamera = selectedCamera,
-                        statusText = statusText,
-                        errorText = errorText,
+                        rawQrText = mobileViewModel.rawQrText,
+                        challengeCode = mobileViewModel.challengeCode,
+                        sessionToken = mobileViewModel.sessionToken,
+                        cameras = mobileViewModel.cameras,
+                        selectedCamera = mobileViewModel.selectedCamera,
+                        isViewerFullScreen = mobileViewModel.isViewerFullScreen,
+                        statusText = mobileViewModel.statusText,
+                        errorText = mobileViewModel.errorText,
                         onChallengeCodeChange = { newValue ->
-                            val sanitizedCode = newValue
-                                .filter { it.isDigit() }
-                                .take(6)
-
-                            challengeCode = sanitizedCode
-
-                            val pairingInfo = parsePairingQrInfo(rawQrText)
-
-                            when {
-                                pairingInfo == null -> {
-                                    pairingRequestStarted = false
-                                    statusText = "Scan a valid AerisCam Desktop QR first."
-                                }
-
-                                sanitizedCode.length < 6 -> {
-                                    pairingRequestStarted = false
-                                    lastInvalidChallengeCode = ""
-                                    statusText = "Enter the 6-digit code shown on AerisCam Desktop."
-                                }
-
-                                !isChallengeCodeValid(pairingInfo, sanitizedCode) -> {
-                                    pairingRequestStarted = false
-                                    sessionToken = ""
-                                    cameras = emptyList()
-                                    selectedCamera = null
-                                    errorText = ""
-
-                                    val newAttemptCount = if (sanitizedCode != lastInvalidChallengeCode) {
-                                        lastInvalidChallengeCode = sanitizedCode
-                                        invalidChallengeAttempts + 1
-                                    } else {
-                                        invalidChallengeAttempts
-                                    }
-
-                                    invalidChallengeAttempts = newAttemptCount
-
-                                    if (newAttemptCount >= MAX_INVALID_CHALLENGE_ATTEMPTS) {
-                                        rawQrText = ""
-                                        challengeCode = ""
-                                        invalidChallengeAttempts = 0
-                                        lastInvalidChallengeCode = ""
-                                        pairingRequestStarted = false
-                                        sessionToken = ""
-                                        cameras = emptyList()
-                                        selectedCamera = null
-
-                                        statusText = "Too many invalid codes. Please create and scan a new AerisCam Desktop QR."
-                                    } else {
-                                        val attemptsLeft = MAX_INVALID_CHALLENGE_ATTEMPTS - newAttemptCount
-                                        statusText = "Code does not match. $attemptsLeft attempt(s) left before a new QR is required."
-                                    }
-                                }
-
-                                !pairingRequestStarted -> {
-                                    pairingRequestStarted = true
-                                    errorText = ""
-                                    statusText = "Code accepted locally. Waiting for desktop approval..."
-
-                                    lifecycleScope.launch {
-                                        try {
-                                            val result = sendPairingConfirmRequest(
-                                                pairingInfo = pairingInfo,
-                                                challengeCode = sanitizedCode
-                                            )
-
-                                            if (result.status == "paired") {
-                                                invalidChallengeAttempts = 0
-                                                lastInvalidChallengeCode = ""
-                                                sessionToken = result.sessionToken
-                                                statusText = "Pairing successful. Loading cameras..."
-
-                                                cameras = fetchCameraList(
-                                                    bridgeUrl = pairingInfo.bridgeUrl,
-                                                    sessionToken = result.sessionToken
-                                                )
-
-                                                statusText = "Pairing successful. Loaded ${cameras.size} camera(s)."
-                                            } else {
-                                                statusText = result.message.ifBlank { "Pairing response: ${result.status}" }
-                                            }
-
-                                        } catch (exception: Exception) {
-                                            pairingRequestStarted = false
-
-                                            val message = exception.message ?: exception::class.java.simpleName
-
-                                            if (message.contains("HTTP 429")) {
-                                                rawQrText = ""
-                                                challengeCode = ""
-                                                invalidChallengeAttempts = 0
-                                                lastInvalidChallengeCode = ""
-                                                sessionToken = ""
-                                                cameras = emptyList()
-                                                selectedCamera = null
-                                                statusText = "Too many invalid pairing attempts. Please create and scan a new AerisCam Desktop QR."
-                                                errorText = ""
-                                            } else {
-                                                statusText = "Pairing request failed."
-                                                errorText = message
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            handleChallengeCodeChange(newValue)
                         },
                         onScanQrClick = {
-                            errorText = ""
-                            statusText = "Opening QR scanner..."
-
-                            startQrScan(
-                                onRawValue = { scannedText ->
-                                    rawQrText = scannedText
-                                    challengeCode = ""
-                                    invalidChallengeAttempts = 0
-                                    lastInvalidChallengeCode = ""
-                                    pairingRequestStarted = false
-                                    sessionToken = ""
-                                    cameras = emptyList()
-                                    selectedCamera = null
-
-                                    val pairingInfo = parsePairingQrInfo(scannedText)
-
-                                    statusText = if (pairingInfo == null) {
-                                        "QR scanned, but it does not look like AerisCam pairing JSON."
-                                    } else {
-                                        "AerisCam QR scanned. Enter the 6-digit code shown on desktop."
-                                    }
-                                },
-                                onCanceled = {
-                                    statusText = "QR scan cancelled."
-                                },
-                                onFailure = { exception ->
-                                    statusText = "QR scan failed."
-                                    errorText = exception.message ?: exception::class.java.simpleName
-                                }
-                            )
+                            handleScanQrClick()
                         },
                         onCameraClick = { camera ->
-                            selectedCamera = camera
+                            mobileViewModel.selectedCamera = camera
+                            mobileViewModel.isViewerFullScreen = false
                         },
                         onBackToCameraListClick = {
-                            selectedCamera = null
+                            mobileViewModel.selectedCamera = null
+                            mobileViewModel.isViewerFullScreen = false
+                        },
+                        onToggleViewerFullScreen = {
+                            mobileViewModel.isViewerFullScreen =
+                                !mobileViewModel.isViewerFullScreen
+                        },
+                        onExitViewerFullScreen = {
+                            mobileViewModel.isViewerFullScreen = false
                         },
                     )
                 }
             }
         }
+    }
+
+    private fun handleChallengeCodeChange(newValue: String) {
+        val sanitizedCode = newValue
+            .filter { it.isDigit() }
+            .take(6)
+
+        mobileViewModel.challengeCode = sanitizedCode
+
+        val pairingInfo = parsePairingQrInfo(mobileViewModel.rawQrText)
+
+        when {
+            pairingInfo == null -> {
+                mobileViewModel.pairingRequestStarted = false
+                mobileViewModel.statusText = "Scan a valid AerisCam Desktop QR first."
+            }
+
+            sanitizedCode.length < 6 -> {
+                mobileViewModel.pairingRequestStarted = false
+                mobileViewModel.lastInvalidChallengeCode = ""
+                mobileViewModel.statusText = "Enter the 6-digit code shown on AerisCam Desktop."
+            }
+
+            !isChallengeCodeValid(pairingInfo, sanitizedCode) -> {
+                mobileViewModel.pairingRequestStarted = false
+                mobileViewModel.clearSessionAndViewerState()
+                mobileViewModel.errorText = ""
+
+                val newAttemptCount = if (sanitizedCode != mobileViewModel.lastInvalidChallengeCode) {
+                    mobileViewModel.lastInvalidChallengeCode = sanitizedCode
+                    mobileViewModel.invalidChallengeAttempts + 1
+                } else {
+                    mobileViewModel.invalidChallengeAttempts
+                }
+
+                mobileViewModel.invalidChallengeAttempts = newAttemptCount
+
+                if (newAttemptCount >= MAX_INVALID_CHALLENGE_ATTEMPTS) {
+                    mobileViewModel.clearPairingChallengeAndSession()
+                    mobileViewModel.statusText =
+                        "Too many invalid codes. Please create and scan a new AerisCam Desktop QR."
+                } else {
+                    val attemptsLeft = MAX_INVALID_CHALLENGE_ATTEMPTS - newAttemptCount
+                    mobileViewModel.statusText =
+                        "Code does not match. $attemptsLeft attempt(s) left before a new QR is required."
+                }
+            }
+
+            !mobileViewModel.pairingRequestStarted -> {
+                val validPairingInfo = pairingInfo
+
+                mobileViewModel.pairingRequestStarted = true
+                mobileViewModel.errorText = ""
+                mobileViewModel.statusText =
+                    "Code accepted locally. Waiting for desktop approval..."
+
+                lifecycleScope.launch {
+                    try {
+                        val result = sendPairingConfirmRequest(
+                            pairingInfo = validPairingInfo,
+                            challengeCode = sanitizedCode
+                        )
+
+                        if (result.status == "paired") {
+                            mobileViewModel.invalidChallengeAttempts = 0
+                            mobileViewModel.lastInvalidChallengeCode = ""
+                            mobileViewModel.sessionToken = result.sessionToken
+                            mobileViewModel.statusText = "Pairing successful. Loading cameras..."
+
+                            mobileViewModel.cameras = fetchCameraList(
+                                bridgeUrl = validPairingInfo.bridgeUrl,
+                                sessionToken = result.sessionToken
+                            )
+
+                            mobileViewModel.statusText =
+                                "Pairing successful. Loaded ${mobileViewModel.cameras.size} camera(s)."
+                        } else {
+                            mobileViewModel.statusText = result.message.ifBlank {
+                                "Pairing response: ${result.status}"
+                            }
+                        }
+
+                    } catch (exception: Exception) {
+                        mobileViewModel.pairingRequestStarted = false
+
+                        val message = exception.message ?: exception::class.java.simpleName
+
+                        if (message.contains("HTTP 429")) {
+                            mobileViewModel.clearPairingChallengeAndSession()
+                            mobileViewModel.statusText =
+                                "Too many invalid pairing attempts. Please create and scan a new AerisCam Desktop QR."
+                            mobileViewModel.errorText = ""
+                        } else {
+                            mobileViewModel.statusText = "Pairing request failed."
+                            mobileViewModel.errorText = message
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleScanQrClick() {
+        mobileViewModel.errorText = ""
+        mobileViewModel.statusText = "Opening QR scanner..."
+
+        startQrScan(
+            onRawValue = { scannedText ->
+                mobileViewModel.resetForScannedQr(scannedText)
+
+                val pairingInfo = parsePairingQrInfo(scannedText)
+
+                mobileViewModel.statusText = if (pairingInfo == null) {
+                    "QR scanned, but it does not look like AerisCam pairing JSON."
+                } else {
+                    "AerisCam QR scanned. Enter the 6-digit code shown on desktop."
+                }
+            },
+            onCanceled = {
+                mobileViewModel.statusText = "QR scan cancelled."
+            },
+            onFailure = { exception ->
+                mobileViewModel.statusText = "QR scan failed."
+                mobileViewModel.errorText = exception.message ?: exception::class.java.simpleName
+            }
+        )
     }
 
     private fun startQrScan(
@@ -303,14 +305,33 @@ fun AerisCamMobilePairingScreen(
     sessionToken: String,
     cameras: List<MobileCamera>,
     selectedCamera: MobileCamera?,
+    isViewerFullScreen: Boolean,
     statusText: String,
     errorText: String,
     onChallengeCodeChange: (String) -> Unit,
     onScanQrClick: () -> Unit,
     onCameraClick: (MobileCamera) -> Unit,
-    onBackToCameraListClick: () -> Unit
+    onBackToCameraListClick: () -> Unit,
+    onToggleViewerFullScreen: () -> Unit,
+    onExitViewerFullScreen: () -> Unit
 ){
     val pairingInfo = parsePairingQrInfo(rawQrText)
+
+    BackHandler(enabled = isViewerFullScreen) {
+        onExitViewerFullScreen()
+    }
+
+    if (isViewerFullScreen && sessionToken.isNotBlank() && selectedCamera != null && pairingInfo != null) {
+        CameraViewerCard(
+            pairingInfo = pairingInfo,
+            sessionToken = sessionToken,
+            camera = selectedCamera,
+            isFullScreen = true,
+            onBackClick = onBackToCameraListClick,
+            onToggleFullScreen = onToggleViewerFullScreen
+        )
+        return
+    }
 
     Column(
         modifier = Modifier
@@ -380,7 +401,9 @@ fun AerisCamMobilePairingScreen(
                     pairingInfo = pairingInfo,
                     sessionToken = sessionToken,
                     camera = selectedCamera,
-                    onBackClick = onBackToCameraListClick
+                    isFullScreen = false,
+                    onBackClick = onBackToCameraListClick,
+                    onToggleFullScreen = onToggleViewerFullScreen
                 )
             } else {
                 CameraListCard(
@@ -442,7 +465,9 @@ private fun CameraViewerCard(
     pairingInfo: PairingQrInfo,
     sessionToken: String,
     camera: MobileCamera,
-    onBackClick: () -> Unit
+    isFullScreen: Boolean,
+    onBackClick: () -> Unit,
+    onToggleFullScreen: () -> Unit
 ) {
     var frame by remember(camera.id, sessionToken) {
         mutableStateOf<ImageBitmap?>(null)
@@ -495,6 +520,64 @@ private fun CameraViewerCard(
         }
     }
 
+    if (isFullScreen) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color.Black
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                frame?.let { image ->
+                    Image(
+                        bitmap = image,
+                        contentDescription = "Fullscreen LQ camera image for ${camera.name}",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(camera.id) {
+                                detectTapGestures(
+                                    onDoubleTap = { onToggleFullScreen() }
+                                )
+                            },
+                        contentScale = ContentScale.Fit
+                    )
+                } ?: Text(
+                    text = "Waiting for first image...",
+                    color = Color.White
+                )
+
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = camera.name,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "Double tap to exit fullscreen",
+                        color = Color.White
+                    )
+                }
+
+                if (viewerError.isNotBlank()) {
+                    Text(
+                        text = viewerError,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(12.dp)
+                    )
+                }
+            }
+        }
+        return
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth()
     ) {
@@ -514,7 +597,13 @@ private fun CameraViewerCard(
                 Image(
                     bitmap = image,
                     contentDescription = "LQ camera image for ${camera.name}",
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .pointerInput(camera.id) {
+                            detectTapGestures(
+                                onDoubleTap = { onToggleFullScreen() }
+                            )
+                        },
                     contentScale = ContentScale.FillWidth
                 )
             } ?: Text("Waiting for first image...")
@@ -527,6 +616,13 @@ private fun CameraViewerCard(
             }
 
             Text("Frames loaded: $frameCount")
+
+            Button(
+                onClick = onToggleFullScreen,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Fullscreen")
+            }
 
             Button(
                 onClick = onBackClick,
